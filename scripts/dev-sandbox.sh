@@ -158,6 +158,18 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Helper files the sandbox copies in (the fake-internet proxy, the ssh shim).
+# They sit next to this script in the repo, but the Nix wrapper installs the
+# script into the store on its own, so it exports DEV_SANDBOX_ASSETS to point
+# here.
+SANDBOX_ASSETS="${DEV_SANDBOX_ASSETS:-$SCRIPT_DIR/sandbox}"
+for asset in proxy.py ssh-shim.sh; do
+  [ -f "$SANDBOX_ASSETS/$asset" ] || {
+    echo "error: missing sandbox asset: $SANDBOX_ASSETS/$asset" >&2
+    exit 1
+  }
+done
+
 print_help() {
   cat <<'EOF'
 Usage: dev-sandbox.sh [options] [--] <command...>
@@ -523,156 +535,24 @@ if [ -n "$UPSTREAM_REPO" ]; then
 fi
 
 if [ ! -f "$SANDBOX_ROOT/root/certs/ca.pem" ]; then
-  openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+  if ! ca_error="$(openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
     -subj '/CN=Hermes dev sandbox CA' \
     -keyout "$SANDBOX_ROOT/root/certs/ca.key" \
-    -out "$SANDBOX_ROOT/root/certs/ca.pem" >/dev/null 2>&1
+    -out "$SANDBOX_ROOT/root/certs/ca.pem" 2>&1 >/dev/null)"; then
+    echo 'error: could not create the sandbox CA:' >&2
+    printf '%s\n' "$ca_error" >&2
+    exit 1
+  fi
 fi
 GIT_UPLOAD_PACK="$(command -v git-upload-pack)"
-printf '#!%s\nexec %q /work/repos/hermes-agent.git\n' "$SANDBOX_SHELL" "$GIT_UPLOAD_PACK" \
+sed "s|@GIT_UPLOAD_PACK@|$GIT_UPLOAD_PACK|" "$SANDBOX_ASSETS/ssh-shim.sh" \
   > "$SANDBOX_ROOT/root/usr/bin/ssh"
 chmod 700 "$SANDBOX_ROOT/root/usr/bin/ssh"
 
-cat > "$SANDBOX_ROOT/root/proxy.py" <<'PY'
-import pathlib, socket, ssl, subprocess, sys, threading
-from urllib.parse import unquote, urlsplit
-
-ROOT, CERTS, REAL_CA = map(pathlib.Path, sys.argv[1:])
-
-def read_request(conn):
-    data = b""
-    while b"\r\n\r\n" not in data and len(data) < 65536:
-        part = conn.recv(4096)
-        if not part:
-            return b""
-        data += part
-    return data
-
-def run_openssl(args):
-    # Capture stderr instead of discarding it: a CalledProcessError whose only
-    # detail is the argv tells you nothing about WHY openssl refused (a missing
-    # CA key, an unwritable dir, an option the host's version rejects), which
-    # reaches the caller as a bare `curl: (35) Recv failure`.
-    done = subprocess.run(['openssl', *args], stdout=subprocess.DEVNULL,
-                          stderr=subprocess.PIPE)
-    if done.returncode != 0:
-        detail = done.stderr.decode('utf-8', 'replace').strip()
-        raise RuntimeError(
-            f'openssl {args[0]} failed (exit {done.returncode}): {detail}')
-
-def cert_for(host):
-    safe = ''.join(char if char.isalnum() or char in '.-' else '_' for char in host)
-    cert, key = CERTS / f'{safe}.pem', CERTS / f'{safe}.key'
-    if not cert.exists():
-        csr = CERTS / f'{safe}.csr'
-        run_openssl(['req', '-newkey', 'rsa:2048', '-nodes',
-                     '-subj', f'/CN={host}', '-addext', f'subjectAltName=DNS:{host}',
-                     '-keyout', str(key), '-out', str(csr)])
-        run_openssl(['x509', '-req', '-days', '2', '-in', str(csr),
-                     '-CA', str(CERTS / 'ca.pem'), '-CAkey', str(CERTS / 'ca.key'),
-                     '-CAcreateserial', '-copy_extensions', 'copy', '-out', str(cert)])
-    return cert, key
-
-def file_for(host, target):
-    path = urlsplit(target).path or '/'
-    parts = pathlib.PurePosixPath(unquote(path)).parts
-    if '..' in parts:
-        return None
-    candidate = ROOT / host / pathlib.PurePosixPath(*[part for part in parts if part != '/'])
-    if candidate.is_dir():
-        candidate /= 'index.html'
-    return candidate if candidate.is_file() else None
-
-def respond_fixture(conn, found):
-    body = found.read_bytes()
-    header = b'HTTP/1.1 200 OK\r\n'
-    conn.sendall(header + f'Content-Length: {len(body)}\r\nConnection: close\r\n\r\n'.encode() + body)
-
-def close_request(request, target=None):
-    headers, separator, body = request.partition(b'\r\n\r\n')
-    lines = headers.split(b'\r\n')
-    if target is not None:
-        method, _, version = lines[0].split(b' ', 2)
-        lines[0] = b' '.join((method, target.encode(), version))
-    lines = [line for line in lines if not line.lower().startswith(b'proxy-connection:')]
-    lines.append(b'Connection: close')
-    return b'\r\n'.join(lines) + separator + body
-
-def relay(source, destination):
-    while True:
-        chunk = source.recv(65536)
-        if not chunk:
-            return
-        destination.sendall(chunk)
-
-def forward_https(conn, host, port, request):
-    context = ssl.create_default_context(cafile=str(REAL_CA))
-    with socket.create_connection((host, port), timeout=30) as raw:
-        with context.wrap_socket(raw, server_hostname=host) as upstream:
-            upstream.sendall(close_request(request))
-            relay(upstream, conn)
-
-def forward_http(conn, host, port, request, target):
-    parsed = urlsplit(target)
-    path = parsed.path or '/'
-    if parsed.query:
-        path += f'?{parsed.query}'
-    with socket.create_connection((host, port), timeout=30) as upstream:
-        upstream.sendall(close_request(request, path))
-        relay(upstream, conn)
-
-def handle_request(conn):
-    with conn:
-        request = read_request(conn)
-        if not request:
-            return
-        line = request.split(b'\r\n', 1)[0].decode('iso-8859-1')
-        method, target, _ = line.split(' ', 2)
-        if method.upper() == 'CONNECT':
-            host, _, port_text = target.rpartition(':')
-            port = int(port_text or '443')
-            conn.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
-            cert, key = cert_for(host)
-            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            context.load_cert_chain(cert, key)
-            with context.wrap_socket(conn, server_side=True) as tls:
-                nested = read_request(tls)
-                if nested:
-                    nested_target = nested.split(b'\r\n', 1)[0].decode('iso-8859-1').split(' ', 2)[1]
-                    found = file_for(host, nested_target)
-                    if found is not None:
-                        respond_fixture(tls, found)
-                    else:
-                        forward_https(tls, host, port, nested)
-            return
-        parsed = urlsplit(target)
-        host = parsed.hostname
-        if not host:
-            for header in request.split(b'\r\n')[1:]:
-                if header.lower().startswith(b'host:'):
-                    host = header.split(b':', 1)[1].strip().decode().split(':', 1)[0]
-                    break
-        host = host or 'unknown'
-        found = file_for(host, target)
-        if found is not None:
-            respond_fixture(conn, found)
-        else:
-            forward_http(conn, host, parsed.port or 80, request, target)
-
-def handle(conn):
-    try:
-        handle_request(conn)
-    except Exception as error:
-        print(f'proxy request failed: {error!r}', file=sys.stderr, flush=True)
-
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(('127.0.0.1', 8080))
-    server.listen()
-    while True:
-        conn, _ = server.accept()
-        threading.Thread(target=handle, args=(conn,), daemon=True).start()
-PY
+# The fake-internet proxy and the ssh shim are real files under
+# scripts/sandbox/ rather than heredocs, so they can be linted, syntax-checked
+# and diffed like any other source. Copy them into the sandbox tree.
+cp "$SANDBOX_ASSETS/proxy.py" "$SANDBOX_ROOT/root/proxy.py"
 
 if [ "$INSTALL_FROM_MAIN" = true ]; then
   echo "[sandbox] fake main: real upstream main ($UPSTREAM_COMMIT)" >&2
