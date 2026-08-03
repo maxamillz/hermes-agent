@@ -84,6 +84,7 @@ if [ "${1:-}" = "--internal-sandbox" ]; then
   # directories read-only and override only the individual files we shim.
   runtime_mounts=()
   shim_mounts=()
+  etc_mounts=()
   if [ -d /nix ] && [[ "$(readlink -f "$DEV_SANDBOX_BASH")" == /nix/* ]]; then
     runtime_mounts+=(--ro-bind /nix /nix)
     shim_mounts+=(
@@ -98,6 +99,13 @@ if [ "${1:-}" = "--internal-sandbox" ]; then
     for path in /usr /bin /sbin /lib /lib64; do
       [ -e "$path" ] && runtime_mounts+=(--ro-bind "$path" "$path")
     done
+    # Debian/Ubuntu route many binaries through the alternatives system:
+    # /usr/bin/awk is a symlink to /etc/alternatives/awk. The sandbox replaces
+    # /etc with its own, so without this those symlinks dangle and the payload
+    # sees "awk: not found" for a binary that is plainly on PATH. Bound after
+    # /etc below via etc_mounts.
+    [ -d /etc/alternatives ] \
+      && etc_mounts+=(--ro-bind /etc/alternatives /etc/alternatives)
     # The git-upload-pack shim standing in for github.com is the only file that
     # must beat the host's copy; sh/ls/env are already there for real.
     shim_mounts+=(--bind "$DEV_SANDBOX_ROOT/root/usr/bin/ssh" /usr/bin/ssh)
@@ -113,6 +121,7 @@ if [ "${1:-}" = "--internal-sandbox" ]; then
     --bind "$DEV_SANDBOX_ROOT/root/usr/local" /usr/local \
     "${home_mounts[@]}" \
     --bind "$DEV_SANDBOX_ROOT/etc" /etc \
+    "${etc_mounts[@]}" \
     --chdir /work/repo \
     --clearenv \
     --setenv PATH "$DEV_SANDBOX_HOME/.local/bin:/usr/local/bin:/usr/bin:$PATH" \
