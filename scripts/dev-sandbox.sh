@@ -123,6 +123,7 @@ if [ "${1:-}" = "--internal-sandbox" ]; then
     --setenv SSL_CERT_FILE /work/certs/ca.pem \
     --setenv GIT_SSL_CAINFO /work/certs/ca.pem \
     --setenv NODE_EXTRA_CA_CERTS /work/certs/real-ca.pem \
+    --setenv OPENSSL_CONF /work/certs/openssl.cnf \
     --setenv HTTP_PROXY http://127.0.0.1:8080 \
     --setenv HTTPS_PROXY http://127.0.0.1:8080 \
     --setenv ALL_PROXY http://127.0.0.1:8080 \
@@ -163,7 +164,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # script into the store on its own, so it exports DEV_SANDBOX_ASSETS to point
 # here.
 SANDBOX_ASSETS="${DEV_SANDBOX_ASSETS:-$SCRIPT_DIR/sandbox}"
-for asset in proxy.py ssh-shim.sh; do
+for asset in proxy.py ssh-shim.sh openssl.cnf; do
   [ -f "$SANDBOX_ASSETS/$asset" ] || {
     echo "error: missing sandbox asset: $SANDBOX_ASSETS/$asset" >&2
     exit 1
@@ -534,9 +535,16 @@ if [ -n "$UPSTREAM_REPO" ]; then
   rm -rf -- "$UPSTREAM_REPO"
 fi
 
+# openssl reads a config even for `req -addext`, and its compiled-in path is a
+# symlink into /etc/ssl on Debian/Ubuntu -- which the sandbox replaces. Ship our
+# own and point OPENSSL_CONF at it, both here and inside the sandbox.
+cp "$SANDBOX_ASSETS/openssl.cnf" "$SANDBOX_ROOT/root/certs/openssl.cnf"
+
 if [ ! -f "$SANDBOX_ROOT/root/certs/ca.pem" ]; then
-  if ! ca_error="$(openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+  if ! ca_error="$(OPENSSL_CONF="$SANDBOX_ROOT/root/certs/openssl.cnf" \
+    openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
     -subj '/CN=Hermes dev sandbox CA' \
+    -extensions sandbox_ca_ext \
     -keyout "$SANDBOX_ROOT/root/certs/ca.key" \
     -out "$SANDBOX_ROOT/root/certs/ca.pem" 2>&1 >/dev/null)"; then
     echo 'error: could not create the sandbox CA:' >&2
