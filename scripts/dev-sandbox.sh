@@ -548,19 +548,29 @@ def read_request(conn):
         data += part
     return data
 
+def run_openssl(args):
+    # Capture stderr instead of discarding it: a CalledProcessError whose only
+    # detail is the argv tells you nothing about WHY openssl refused (a missing
+    # CA key, an unwritable dir, an option the host's version rejects), which
+    # reaches the caller as a bare `curl: (35) Recv failure`.
+    done = subprocess.run(['openssl', *args], stdout=subprocess.DEVNULL,
+                          stderr=subprocess.PIPE)
+    if done.returncode != 0:
+        detail = done.stderr.decode('utf-8', 'replace').strip()
+        raise RuntimeError(
+            f'openssl {args[0]} failed (exit {done.returncode}): {detail}')
+
 def cert_for(host):
     safe = ''.join(char if char.isalnum() or char in '.-' else '_' for char in host)
     cert, key = CERTS / f'{safe}.pem', CERTS / f'{safe}.key'
     if not cert.exists():
         csr = CERTS / f'{safe}.csr'
-        subprocess.run(['openssl', 'req', '-newkey', 'rsa:2048', '-nodes',
-                        '-subj', f'/CN={host}', '-addext', f'subjectAltName=DNS:{host}',
-                        '-keyout', str(key), '-out', str(csr)], check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(['openssl', 'x509', '-req', '-days', '2', '-in', str(csr),
-                        '-CA', str(CERTS / 'ca.pem'), '-CAkey', str(CERTS / 'ca.key'),
-                        '-CAcreateserial', '-copy_extensions', 'copy', '-out', str(cert)],
-                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        run_openssl(['req', '-newkey', 'rsa:2048', '-nodes',
+                     '-subj', f'/CN={host}', '-addext', f'subjectAltName=DNS:{host}',
+                     '-keyout', str(key), '-out', str(csr)])
+        run_openssl(['x509', '-req', '-days', '2', '-in', str(csr),
+                     '-CA', str(CERTS / 'ca.pem'), '-CAkey', str(CERTS / 'ca.key'),
+                     '-CAcreateserial', '-copy_extensions', 'copy', '-out', str(cert)])
     return cert, key
 
 def file_for(host, target):
