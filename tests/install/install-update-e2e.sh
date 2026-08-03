@@ -70,7 +70,13 @@ fail() { printf '\n\033[1;31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 # artifact upload can find them, and echo the proxy log since it is the usual
 # culprit.
 collect_sandbox_logs() {
-  local tag="$1" src="$SANDBOX_ROOT/root/logs" dest="$LOG_DIR/sandbox-$tag"
+  # Separate `local` statements on purpose: a single `local a=$1 b="$a"` does
+  # NOT see the earlier assignment, so under `set -u` the second expansion dies
+  # with "a: unbound variable" -- which is exactly how this helper managed to
+  # crash while trying to report someone else's failure.
+  local tag="$1"
+  local src="$SANDBOX_ROOT/root/logs"
+  local dest="$LOG_DIR/sandbox-$tag"
   [ -d "$src" ] || return 0
   mkdir -p "$dest"
   cp -a "$src/." "$dest/" 2>/dev/null || true
