@@ -157,9 +157,16 @@ def finalize_turn(
                 from hermes_cli import kanban_db as _kb
                 _conn = _kb.connect()
                 try:
+                    # Dispatcher callers own their claim; worker callbacks must
+                    # prove ownership with the run pinned when they were spawned.
+                    try:
+                        _run_id = int(os.environ.get("HERMES_KANBAN_RUN_ID", ""))
+                    except (TypeError, ValueError):
+                        _run_id = None
                     _kb._record_task_failure(
                         _conn,
                         _kanban_task,
+                        expected_run_id=_run_id,
                         error=(
                             f"Iteration budget exhausted "
                             f"({api_call_count}/{agent.max_iterations}) — "

@@ -1,0 +1,410 @@
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -1355,6 +1355,7 @@
+     end_run: bool = False,
+     event_payload_extra: Optional[dict] = None,
+     infrastructure: bool = False,
++    expected_run_id: Optional[int] = None,
+ ) -> bool:
+     """Record a non-success outcome and maybe trip the circuit breaker; every
+     non-success path funnels through here so ``consecutive_failures`` stays
+@@ -1373,6 +1374,19 @@
+     with ``infrastructure: true`` but ``consecutive_failures`` is left alone and
+     the breaker never trips; the card stays retryable and
+     :func:`check_respawn_guard` spaces the retries.
++
++    ``expected_run_id``: proof of ownership for a callback that fires OUTSIDE
++    the dispatcher's own claim/reconcile loop (e.g. a worker process's own
++    trailing iteration-budget finalizer). Without it, a callback racing a
++    terminal handoff (``request_review`` et al.) that already closed this run
++    and let the task move on — reclaimed, re-reviewed, respawned — would match
++    ``status = 'running'`` against the SUCCESSOR run and steal its claim. When
++    given, it is checked against the task's CURRENT ``current_run_id`` before
++    any mutation; a mismatch (superseded or already-closed) is a no-op, same as
++    every other lifecycle mutator's run-identity fence (``request_review``,
++    ``block_task``, ``goal_run_status``). Internal dispatcher callers that
++    already hold proof via their own row read (stale-claim sweep, spawn
++    failure) pass nothing and are unaffected.
+     """
+     if failure_limit is None:
+         failure_limit = DEFAULT_FAILURE_LIMIT
+@@ -1383,6 +1397,10 @@
+             "FROM tasks WHERE id = ?", (task_id,),
+         ).fetchone()
+         if row is None:
++            return False
++        if expected_run_id is not None and (
++            row["current_run_id"] is None or int(row["current_run_id"]) != int(expected_run_id)
++        ):
+             return False
+         retry_status = (
+             _kb._retry_status_for_run(conn, task_id, row["current_run_id"])
+--- a/agent/turn_finalizer.py
++++ b/agent/turn_finalizer.py
+@@ -56,11 +56,25 @@
+     This is a bounded fallback (#87096): the CAS invariant in ``_end_run`` (``WHERE ended_at IS NULL``)
+     guarantees idempotence — if another path already closed the run this is a no-op — so it is safe to call
+     from multiple exit paths.
++
++    ``expected_run_id`` (this worker's own ``HERMES_KANBAN_RUN_ID``, when the dispatcher
++    pinned one) proves which run this trailing callback belongs to — the same ownership
++    proof every in-turn terminal tool call (``kanban_request_review``, ``kanban_block``, ...)
++    already threads through as ``expected_run_id``/``_worker_run_id``. A turn that calls
++    ``kanban_request_review`` mid-turn and then keeps going until its OWN budget runs out
++    reaches this fallback after the task has already moved on (closed, reclaimed, handed to a
++    reviewer); without the run-id fence this would match the task's current ``running`` row by
++    id alone and could close/reclaim a SUCCESSOR run instead of a no-op.
+     """
+     try:
+         from hermes_cli import kanban_db as _kb
+         from hermes_cli import kanban_db_connect as _kbc
+         from hermes_cli import kanban_db_dispatch as _kbd
++        _raw_run_id = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
++        try:
++            _expected_run_id = int(_raw_run_id) if _raw_run_id else None
++        except ValueError:
++            _expected_run_id = None
+         _conn = _kbc.connect()
+         try:
+             _kbd._record_task_failure(
+@@ -74,6 +88,7 @@
+                 release_claim=True,
+                 end_run=True,
+                 event_payload_extra={"budget_used": api_call_count, "budget_max": max_iterations},
++                expected_run_id=_expected_run_id,
+             )
+         finally:
+             with suppress(Exception):
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_trailing_budget_run_ownership.py
+@@ -0,0 +1,330 @@
++"""Regression: a trailing iteration-budget callback must prove run ownership.
++
++Root cause: a dispatcher-owned worker that calls
++``kanban_request_review`` mid-turn and then keeps running until its OWN
++per-turn iteration budget is exhausted reaches
++``agent.turn_finalizer._record_kanban_budget_exhausted`` -> ``_record_task_failure``
++AFTER the task has already moved on (review handoff closed its run; the
++dispatcher may have legitimately reclaimed/respawned the task under a NEW run).
++Every other kanban lifecycle mutator (``request_review``, ``block_task``,
++``goal_run_status``) threads ``expected_run_id`` through and refuses to act
++on a stale/superseded run. ``_record_task_failure`` was the one exception:
++it mutated by task_id alone, so a late callback could match the task's
++CURRENT ``running`` row — which may belong to a brand-new successor run
++(a respawned implementer, or a legitimately dispatched reviewer) — and
++steal its claim / close its run / flip its status.
++
++The fix threads ``expected_run_id`` through ``_record_task_failure`` (and
++through ``agent.turn_finalizer._record_kanban_budget_exhausted``, which reads
++the dispatcher-pinned ``HERMES_KANBAN_RUN_ID``) and gates every mutation on
++``current_run_id == expected_run_id`` when that proof is supplied — the same
++idiom ``request_review``/``block_task`` already use.
++"""
++
++from __future__ import annotations
++
++import logging
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import MagicMock
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++
++
++@pytest.fixture
++def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
++    """Isolated HERMES_HOME with an empty kanban DB (mirrors
++    tests/hermes_cli/test_kanban_review_lifecycle.py's fixture)."""
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    return home
++
++
++def _row(conn, tid):
++    return conn.execute(
++        "SELECT status, current_run_id FROM tasks WHERE id = ?", (tid,),
++    ).fetchone()
++
++
++def _events(conn, tid, kind=None):
++    rows = conn.execute(
++        "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id",
++        (tid,),
++    ).fetchall()
++    import json
++    out = [(r["kind"], json.loads(r["payload"]) if r["payload"] else None) for r in rows]
++    if kind is not None:
++        out = [e for e in out if e[0] == kind]
++    return out
++
++
++def _run_row(conn, run_id):
++    return conn.execute(
++        "SELECT outcome, status, ended_at, claim_lock FROM task_runs WHERE id = ?",
++        (run_id,),
++    ).fetchone()
++
++
++# ---------------------------------------------------------------------------
++# Accepted request_review + trailing old-run budget callback: must be a no-op
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("handoff", ["review", "blocked"])
++def test_valid_handoff_then_same_run_budget_is_noop(kanban_home, handoff):
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="handoff retained", assignee="worker")
++        run_id = kb.claim_task(conn, tid).current_run_id
++        if handoff == "review":
++            assert kb.request_review(conn, tid, summary="Candidate ready", expected_run_id=run_id)
++        else:
++            assert kb.block_task(conn, tid, reason="Owner input", kind="needs_input", expected_run_id=run_id)
++        before = list(conn.iterdump())
++        kbd._record_task_failure(conn, tid, "late timeout", outcome="timed_out",
++                                 release_claim=True, end_run=True, expected_run_id=run_id)
++        assert list(conn.iterdump()) == before
++
++
++def test_trailing_budget_callback_after_review_handoff_does_not_touch_reviewer_run(
++    kanban_home: Path,
++) -> None:
++    """The VoiceLLM shape: review_requested succeeds, the dispatcher legitimately
++    claims a reviewer under a NEW run, and only then does the original worker's
++    own trailing budget callback arrive for the OLD run. It must not touch the
++    reviewer's live claim, nor mutate the already-closed original run."""
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="h3 character swap", assignee="worker")
++        implementer = kb.claim_task(conn, tid)
++        assert implementer is not None
++        old_run_id = implementer.current_run_id
++
++        assert kb.request_review(
++            conn, tid, summary="done, needs review", expected_run_id=old_run_id,
++        ) is True
++        assert kb.get_task(conn, tid).status == "review"
++
++        # Legitimate reviewer dispatch: a brand-new run, independent of the old one.
++        reviewer = kb.claim_review_task(conn, tid)
++        assert reviewer is not None
++        new_run_id = reviewer.current_run_id
++        assert new_run_id != old_run_id
++        assert kb.get_task(conn, tid).status == "running"
++
++        # The stale worker's OWN turn kept going past kanban_request_review and
++        # only now hits ITS iteration budget — a trailing callback pinned to the
++        # old (already-closed) run.
++        tripped = kbd._record_task_failure(
++            conn, tid, "Iteration budget exhausted (150/150)",
++            outcome="timed_out", release_claim=True, end_run=True,
++            event_payload_extra={"budget_used": 150, "budget_max": 150},
++            expected_run_id=old_run_id,
++        )
++        assert tripped is False
++
++        # The reviewer's live run/claim is completely untouched.
++        row = _row(conn, tid)
++        assert row["status"] == "running"
++        assert row["current_run_id"] == new_run_id
++        live = _run_row(conn, new_run_id)
++        assert live["ended_at"] is None
++        assert live["claim_lock"] is not None
++
++        # No spurious timed_out/gave_up event landed on top of the handoff.
++        assert _events(conn, tid, kind="timed_out") == []
++        assert _events(conn, tid, kind="gave_up") == []
++
++        # The original run's own terminal record survives exactly as written.
++        original = _run_row(conn, old_run_id)
++        assert (original["outcome"], original["status"]) == ("review_requested", "review")
++
++
++# ---------------------------------------------------------------------------
++# Blocked handoff + trailing old-run budget callback: must preserve the
++# reclaimed successor run and the original task/run metadata
++# ---------------------------------------------------------------------------
++
++
++def test_trailing_budget_callback_after_blocked_handoff_does_not_touch_new_run(
++    kanban_home: Path,
++) -> None:
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="needs owner input", assignee="worker")
++        claimed = kb.claim_task(conn, tid)
++        assert claimed is not None
++        old_run_id = claimed.current_run_id
++
++        assert kb.block_task(
++            conn, tid, reason="needs owner perceptual review",
++            kind="needs_input", expected_run_id=old_run_id,
++        ) is True
++        assert kb.get_task(conn, tid).status == "blocked"
++
++        # Operator unblocks and the task is claimed again — a fresh successor run.
++        assert kb.unblock_task(conn, tid) is True
++        reclaimed = kb.claim_task(conn, tid)
++        assert reclaimed is not None
++        new_run_id = reclaimed.current_run_id
++        assert new_run_id != old_run_id
++
++        events_before = _events(conn, tid)
++        original_run_before = _run_row(conn, old_run_id)
++
++        # The stale original worker's own trailing budget callback arrives late.
++        tripped = kbd._record_task_failure(
++            conn, tid, "Iteration budget exhausted (150/150)",
++            outcome="timed_out", release_claim=True, end_run=True,
++            event_payload_extra={"budget_used": 150, "budget_max": 150},
++            expected_run_id=old_run_id,
++        )
++        assert tripped is False
++
++        row = _row(conn, tid)
++        assert row["status"] == "running"
++        assert row["current_run_id"] == new_run_id
++        # No new event, and the original run's record is untouched.
++        assert _events(conn, tid) == events_before
++        assert _run_row(conn, old_run_id) == original_run_before
++
++
++# ---------------------------------------------------------------------------
++# No ownership conflict: ordinary budget exhaustion still works exactly as
++# before (same run id throughout — the common, non-racing case)
++# ---------------------------------------------------------------------------
++
++
++def test_trailing_budget_callback_with_matching_run_id_still_retries(
++    kanban_home: Path,
++) -> None:
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="real timeout", assignee="worker")
++        claimed = kb.claim_task(conn, tid)
++        run_id = claimed.current_run_id
++
++        tripped = kbd._record_task_failure(
++            conn, tid, "Iteration budget exhausted (150/150)",
++            outcome="timed_out", release_claim=True, end_run=True,
++            event_payload_extra={"budget_used": 150, "budget_max": 150},
++            expected_run_id=run_id,
++        )
++        assert tripped is False  # one failure, under the trip threshold
++
++        row = _row(conn, tid)
++        assert row["status"] == "ready"
++        assert row["current_run_id"] is None
++
++        ev = _events(conn, tid, kind="timed_out")
++        assert len(ev) == 1
++        # ``event_payload_extra`` only rides the ``gave_up`` trip event; the
++        # ordinary non-tripped timeout event carries failures/retry_status.
++        assert ev[0][1]["retry_status"] == "ready"
++        assert ev[0][1]["failures"] == 1
++
++        closed = _run_row(conn, run_id)
++        assert closed["outcome"] == "timed_out"
++        assert closed["ended_at"] is not None
++
++
++def test_repeated_matching_timeouts_still_trip_to_blocked_gave_up(
++    kanban_home: Path,
++) -> None:
++    """Two REAL consecutive budget exhaustions (each proven against its own
++    live run) still trip the breaker exactly as before: the ownership fence
++    only refuses a callback whose run is no longer current, never a genuine
++    one."""
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="flaky worker", assignee="worker")
++
++        for _ in range(2):
++            claimed = kb.claim_task(conn, tid)
++            assert claimed is not None
++            kbd._record_task_failure(
++                conn, tid, "Iteration budget exhausted (150/150)",
++                outcome="timed_out", release_claim=True, end_run=True,
++                expected_run_id=claimed.current_run_id,
++            )
++
++        row = _row(conn, tid)
++        assert row["status"] == "blocked"
++        gave_up = _events(conn, tid, kind="gave_up")
++        assert len(gave_up) == 1
++        assert gave_up[0][1]["failures"] == 2
++
++
++# ---------------------------------------------------------------------------
++# Valid review dispatch is unaffected by the ownership fence
++# ---------------------------------------------------------------------------
++
++
++def test_review_dispatch_still_claims_after_fix(
++    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    import hermes_cli.config as cfgmod
++    import hermes_cli.profiles as profmod
++
++    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
++    monkeypatch.setattr(
++        cfgmod, "load_config", lambda *a, **k: {"kanban": {"review_dispatch": True}},
++    )
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="needs review", assignee="worker")
++        claimed = kb.claim_task(conn, tid)
++        assert kb.request_review(
++            conn, tid, summary="ready for review", expected_run_id=claimed.current_run_id,
++        ) is True
++        assert kb.get_task(conn, tid).status == "review"
++
++        result = kbd.dispatch_once(conn, dry_run=True)
++        assert tid in [s[0] for s in result.spawned]
++        # dry_run never mutates: still parked in review, ready for a real tick.
++        assert kb.get_task(conn, tid).status == "review"
++
++
++# ---------------------------------------------------------------------------
++# Wiring: the finalizer must thread its own pinned run id through
++# ---------------------------------------------------------------------------
++
++
++def test_record_kanban_budget_exhausted_threads_pinned_run_id(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    from agent.turn_finalizer import _record_kanban_budget_exhausted
++
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "35")
++    record = MagicMock(name="record_task_failure")
++    conn = SimpleNamespace(close=lambda: None)
++    monkeypatch.setattr("hermes_cli.kanban_db_connect.connect", lambda: conn)
++    monkeypatch.setattr("hermes_cli.kanban_db_dispatch._record_task_failure", record)
++
++    _record_kanban_budget_exhausted("t_3ce0e0f9", 150, 150, logging.getLogger("test"))
++
++    record.assert_called_once()
++    _, kwargs = record.call_args
++    assert kwargs["expected_run_id"] == 35
++
++
++def test_record_kanban_budget_exhausted_tolerates_missing_run_id(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """No pinned run id (shouldn't normally happen for a dispatcher-owned
++    worker, but must degrade safely) -> no ownership gating, same as before
++    this fix for every existing caller."""
++    from agent.turn_finalizer import _record_kanban_budget_exhausted
++
++    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
++    record = MagicMock(name="record_task_failure")
++    conn = SimpleNamespace(close=lambda: None)
++    monkeypatch.setattr("hermes_cli.kanban_db_connect.connect", lambda: conn)
++    monkeypatch.setattr("hermes_cli.kanban_db_dispatch._record_task_failure", record)
++
++    _record_kanban_budget_exhausted("t_fbcf9bf0", 150, 150, logging.getLogger("test"))
++
++    record.assert_called_once()
++    _, kwargs = record.call_args
++    assert kwargs["expected_run_id"] is None
